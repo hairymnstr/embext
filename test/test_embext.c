@@ -9,7 +9,7 @@
 #include "block.h"
 #include "embext.h"
 
-int main(int argc, char *argv[]) {
+int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unused__))) {
   int p = 0;
   int result;
   char buffer[256];
@@ -30,8 +30,8 @@ int main(int argc, char *argv[]) {
 
   printf("   %d\n", result);
   
-  struct file_ent *fe = ext2_open(context, "/", O_RDONLY, 0777, &result);
-  struct file_ent *fe2;
+  void *fe = ext2_open(context, "/", O_RDONLY, 0777, &result);
+  void *fe2;
   struct dirent *de;
   
   while((de = ext2_readdir(fe, &result))) {
@@ -55,7 +55,6 @@ int main(int argc, char *argv[]) {
   FILE *fw = fopen("dump.png", "wb");
   fe = ext2_open(context, "/static/test_image.png", O_RDONLY, 0777, &result);
   printf("%p\n", fe);
-  printf("fe->inode_number = %d\n", fe->inode_number);
   while((p = ext2_read(fe, &buffer, sizeof(buffer), &result)) == sizeof(buffer)) {
     fwrite(buffer, 1, p, fw);
   }

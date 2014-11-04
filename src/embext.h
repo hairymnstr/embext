@@ -4,6 +4,7 @@
 #define MAX_PATH_LEN 1024
 #define MAX_PATH_LEVELS 100
 
+#define EXT2_SUPER_MAGIC 0xEF53
 // reserved inode definitions
 #define EXT2_BAD_INO 1
 #define EXT2_ROOT_INO 2
@@ -128,35 +129,27 @@ struct ext2_dirent {
     char name;
 };
 
-struct file_ent {
-    struct ext2context *context;
-    uint32_t flags;
-    uint32_t cursor;
-    uint32_t inode_number;
-    uint32_t sector;
-    uint32_t file_sector;
-    uint32_t sectors_left;
-    uint32_t block_index[3];
-    uint8_t buffer[512];
-    struct inode inode;
-};
-
 int ext2_mount(blockno_t part_start, blockno_t volume_size, uint8_t filesystem_hint, struct ext2context **context);
+int ext2_umount(struct ext2context *context);
 
-struct file_ent *ext2_open(struct ext2context *context, const char *name, int flags, int mode, int *rerrno);
+void *ext2_open(struct ext2context *context, const char *name, int flags, int mode, int *rerrno);
 
-int ext2_close(struct file_ent *fe, int *rerrno);
+int ext2_close(void *vfe, int *rerrno);
 
-int ext2_read(struct file_ent *fe, void *buffer, size_t count, int *rerrno);
+int ext2_read(void *vfe, void *buffer, size_t count, int *rerrno);
 
-int ext2_write(struct file_ent *fe, const void *buffer, size_t count, int *rerrno);
+int ext2_write(void *vfe, const void *buffer, size_t count, int *rerrno);
 
-int ext2_isatty(struct file_ent *fe, int *rerrno);
+int ext2_isatty(void *vfe, int *rerrno);
 
-int ext2_fstat(struct file_ent *fe, struct stat *st, int *rerrno);
+int ext2_fstat(void *vfe, struct stat *st, int *rerrno);
 
-int ext2_lseek(struct file_ent *fe, int ptr, int dir, int *rerrno);
+int ext2_lseek(void *vfe, int ptr, int dir, int *rerrno);
 
-struct dirent *ext2_readdir(struct file_ent *fe, int *rerrno);
+struct dirent *ext2_readdir(void *vfe, int *rerrno);
 
+#ifdef EMBEXT_DEBUG
+void ext2_print_inode(struct inode *in);
+void ext2_print_bg1_bitmap(struct ext2context *context);
+#endif
 #endif /* ifndef EMBEXT2_H */

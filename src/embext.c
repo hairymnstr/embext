@@ -30,7 +30,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
-#ifdef EXT_DEBUG
+#ifdef EMBEXT_DEBUG
 #include <inttypes.h>
 #endif
 #include <stdlib.h>
@@ -42,7 +42,23 @@
 #include "partition.h"
 #include "embext.h"
 
-#ifdef EXT_DEBUG
+#define EMBEXT_MAGIC 0xEBEDDED2
+
+struct file_ent {
+    uint32_t magic;
+    struct ext2context *context;
+    uint32_t flags;
+    uint32_t cursor;
+    uint32_t inode_number;
+    uint32_t sector;
+    uint32_t file_sector;
+    uint32_t sectors_left;
+    uint32_t block_index[3];
+    uint8_t buffer[512];
+    struct inode inode;
+};
+
+#ifdef EMBEXT_DEBUG
 void ext2_print_inode(struct inode *in) {
     int i;
     printf("i_mode = %" PRIu16 "\n", in->i_mode);
@@ -109,7 +125,7 @@ void ext2_print_bg1_bitmap(struct ext2context *context) {
     bmp_block <<= (context->superblock.s_log_block_size + 1);
     bmp_block += context->part_start;
     
-    while(bmp_read < (1024 << context->superblock.s_log_block_size)) {
+    while(bmp_read < (1024u << context->superblock.s_log_block_size)) {
         block_read(bmp_block, context->sysbuf);
         
         for(j=0;j<16;j++) {
@@ -136,7 +152,7 @@ void ext2_print_bg1_bitmap(struct ext2context *context) {
            bmp_read * 8 - nused
           );
 }
-#endif
+#endif /* ifdef EMBEXT_DEBUG */
 
 int ext2_flush(struct file_ent *fe) {
     if(fe->flags & EXT2_FLAG_DIRTY) {
@@ -192,7 +208,7 @@ int ext2_flush_inode(struct file_ent *fe) {
 }
 
 int ext2_flush_superblock(struct ext2context *context) {
-    int i;
+    uint32_t i;
     
     memset(context->sysbuf, 0, block_get_block_size());
     for(i=0;i<context->num_superblocks;i++) {
@@ -258,7 +274,7 @@ int ext2_get_bg_descriptor(struct ext2context *context,
 int ext2_write_bg_descriptor(struct ext2context *context,
                              struct block_group_descriptor *bg,
                              uint32_t block_group) {
-    int i;
+    uint32_t i;
     uint32_t lba_block;
     if(block_group >= context->num_blockgroups) {
         return -1;
@@ -360,7 +376,6 @@ int ext2_change_allocated(struct ext2context *context,
 }
 
 uint32_t ext2_allocate_block(struct ext2context *context, uint32_t previous_block, int for_directory) {
-    int i;
     uint32_t lba_block;
     uint32_t bitmap_offset;
     struct block_group_descriptor bg;
@@ -535,13 +550,26 @@ int is_power(int x, int ofy) {
 }
 
 int ext2_mount(blockno_t part_start, blockno_t volume_size, 
-               uint8_t filesystem_hint, struct ext2context **context) {
-    int i, n;
+               uint8_t filesystem_hint __attribute__((__unused__)), /* don't trust partition table */
+               struct ext2context **context) {
+    uint32_t i;
+    int n;
     (*context) = (struct ext2context *)malloc(sizeof(struct ext2context));
     (*context)->part_start = part_start;
     block_read(part_start+2, (*context)->sysbuf);
     memcpy(&(*context)->superblock, (*context)->sysbuf, sizeof(struct superblock));
     
+    if((*context)->superblock.s_magic != EXT2_SUPER_MAGIC) {
+        free((*context));
+        return -1;
+    }
+    if(((*context)->superblock.s_blocks_count << (*context)->superblock.s_log_block_size) >
+        volume_size
+    ) {
+        free((*context));
+        return -1;
+    }
+        
     if((*context)->superblock.s_log_block_size == 0) {
         (*context)->superblock_block = 1;
     } else {
@@ -608,7 +636,7 @@ int ext2_umount(struct ext2context *context) {
     return 0;
 }
 
-struct file_ent *ext2_open(struct ext2context *context, const char *name, int flags, int mode, 
+void *ext2_open(struct ext2context *context, const char *name, int flags, int mode, 
                            int *rerrno) {
     int i;
     struct file_ent *fe = (struct file_ent *)malloc(sizeof(struct file_ent));
@@ -617,6 +645,7 @@ struct file_ent *ext2_open(struct ext2context *context, const char *name, int fl
         return NULL;
     }
     memset(fe, 0, sizeof(struct file_ent));
+    fe->magic = EMBEXT_MAGIC;
     fe->context = context;
     i = ext2_lookup_path(fe, name, rerrno);
     if((flags & O_RDWR)) {
@@ -715,9 +744,14 @@ struct file_ent *ext2_open(struct ext2context *context, const char *name, int fl
     }
 }
 
-int ext2_close(struct file_ent *fe, int *rerrno) {
+int ext2_close(void *vfe, int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     if(fe == NULL) {
         (*rerrno) = EBADF;
+        return -1;
+    }
+    if(fe->magic != EMBEXT_MAGIC) {
+        *rerrno = EBADF;
         return -1;
     }
     if(fe->flags & EXT2_FLAG_DIRTY) {
@@ -732,17 +766,22 @@ int ext2_close(struct file_ent *fe, int *rerrno) {
             return -1;
         }
     }
-  
+    fe->magic = 0;
     free(fe);
     return 0;
 }
 
-int ext2_read(struct file_ent *fe, void *buffer, size_t count, int *rerrno) {
+int ext2_read(void *vfe, void *buffer, size_t count, int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     uint32_t i=0;
     uint8_t *bt = (uint8_t *)buffer;
     /* make sure this is an open file and it can be read */  
     if(fe == NULL) {
         (*rerrno) = EBADF;
+        return -1;
+    }
+    if(fe->magic != EMBEXT_MAGIC) {
+        *rerrno = EBADF;
         return -1;
     }
     /* copy some bytes to the buffer requested */
@@ -752,7 +791,7 @@ int ext2_read(struct file_ent *fe, void *buffer, size_t count, int *rerrno) {
         }
         *bt++ = *(uint8_t *)(fe->buffer + fe->cursor);
         fe->cursor++;
-        if(fe->cursor == block_get_block_size()) {
+        if(fe->cursor == (uint32_t)block_get_block_size()) {
             ext2_next_sector(fe);
         }
         i++;
@@ -763,12 +802,17 @@ int ext2_read(struct file_ent *fe, void *buffer, size_t count, int *rerrno) {
     return i;
 }
 
-int ext2_write(struct file_ent *fe, const void *buffer, size_t count, 
+int ext2_write(void *vfe, const void *buffer, size_t count, 
                int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     uint32_t i=0;
     uint8_t *bt = (uint8_t *)buffer;
     if(fe == NULL) {
         (*rerrno) = EBADF;
+        return -1;
+    }
+    if(fe->magic != EMBEXT_MAGIC) {
+        *rerrno = EBADF;
         return -1;
     }
     if(!(fe->flags & EXT2_FLAG_WRITE)) {
@@ -801,11 +845,15 @@ int ext2_write(struct file_ent *fe, const void *buffer, size_t count,
     return i;
 }
 
-int ext2_fstat(struct file_ent *fe, struct stat *st, 
+int ext2_fstat(void *vfe, struct stat *st, 
                int *rerrno) {
-    (*rerrno) = 0;
+    struct file_ent *fe = (struct file_ent *)vfe;
     if(fe == NULL) {
         (*rerrno) = EBADF;
+        return -1;
+    }
+    if(fe->magic != EMBEXT_MAGIC) {
+        *rerrno = EBADF;
         return -1;
     }
     st->st_dev = 0;
@@ -828,8 +876,9 @@ int ext2_fstat(struct file_ent *fe, struct stat *st,
     return 0; 
 }
 
-int ext2_lseek(struct file_ent *fe, int ptr, int dir,
+int ext2_lseek(void *vfe, int ptr, int dir,
                int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     unsigned int new_pos;
     unsigned int old_pos;
     int new_sec;
@@ -898,8 +947,11 @@ int ext2_lseek(struct file_ent *fe, int ptr, int dir,
     return new_pos;
 }
 
-int ext2_isatty(struct file_ent *fe, int *rerrno) {
+int ext2_isatty(void *vfe, int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     if(fe == NULL) {
+        *rerrno = EBADF;
+    } else if(fe->magic != EMBEXT_MAGIC) {
         *rerrno = EBADF;
     } else {
         *rerrno = ENOTTY;
@@ -907,7 +959,8 @@ int ext2_isatty(struct file_ent *fe, int *rerrno) {
     return 0;
 }
 
-struct dirent *ext2_readdir(struct file_ent *fe, int *rerrno) {
+struct dirent *ext2_readdir(void *vfe, int *rerrno) {
+    struct file_ent *fe = (struct file_ent *)vfe;
     uint16_t rec_len;
     uint8_t name_len;
     uint8_t file_type;
