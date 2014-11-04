@@ -24,21 +24,35 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
       exit(0);
   }
   
-  printf("[%4d] mount filesystem, FAT32", p++);
+  printf("[%4d] mount filesystem", p++);
   
   result = ext2_mount(0, block_get_volume_size(), 0, &context);
 
   printf("   %d\n", result);
   
+  printf("[%4d] open root folder", p++);
   void *fe = ext2_open(context, "/", O_RDONLY, 0777, &result);
+  if(fe) {
+      printf("    okay\n");
+  } else {
+      printf("    failed [%d]\n", result);
+      exit(1);
+  }
   void *fe2;
   struct dirent *de;
   
   while((de = ext2_readdir(fe, &result))) {
     snprintf(buffer, sizeof(buffer), "/%s", de->d_name);
-    fe2 = ext2_open(context, buffer, O_RDONLY, 0777, &result);
-    ext2_fstat(fe2, &st, &result);
-    printf("%s %d\n", de->d_name, (int)st.st_size);
+    if(!(fe2 = ext2_open(context, buffer, O_RDONLY, 0777, &result))) {
+        printf("Opening %s failed. [%d]\n", buffer, result);
+        exit(1);
+    }
+    
+    if(ext2_fstat(fe2, &st, &result)) {
+        printf("Couldn't stat %s. [%d]\n", buffer, result);
+        exit(1);
+    }
+    printf("/%s [%d] %d\n", de->d_name, de->d_ino, (int)st.st_size);
     if((st.st_mode & S_IFDIR) && (strcmp(de->d_name, ".") != 0) &&
        (strcmp(de->d_name, "..") != 0)) {
 //       printf("Directory contents:\n");
@@ -76,7 +90,7 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
   
   ext2_close(fe, &result);
   
-  ext2_print_bg1_bitmap(context);
+//   ext2_print_bg1_bitmap(context);
   
   ext2_umount(context);
   

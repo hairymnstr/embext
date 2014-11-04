@@ -42,21 +42,63 @@
 #include "partition.h"
 #include "embext.h"
 
+#define ext2_block_size(x) (1024 << x->superblock.s_log_block_size)
+
 #define EMBEXT_MAGIC 0xEBEDDED2
+
+struct buffer_object {
+    uint8_t buffer[512];
+    uint32_t lba_block;
+    uint32_t dirty;
+};
 
 struct file_ent {
     uint32_t magic;
     struct ext2context *context;
     uint32_t flags;
-    uint32_t cursor;
+    int64_t cursor;
     uint32_t inode_number;
-    uint32_t sector;
-    uint32_t file_sector;
-    uint32_t sectors_left;
-    uint32_t block_index[3];
-    uint8_t buffer[512];
+    struct buffer_object buffer;
     struct inode inode;
 };
+
+
+static int ext2_store_buffer(struct ext2context *context, struct buffer_object *buffer) {
+    block_write(buffer->lba_block + context->part_start, buffer->buffer);
+    buffer->dirty = 0;
+    return 0;
+}
+
+static int ext2_load_buffer(struct ext2context *context, uint32_t block_number, uint32_t offset, struct buffer_object *buffer) {
+    if(buffer->dirty) {
+        ext2_store_buffer(context, buffer);
+    }
+    buffer->lba_block = block_number * (ext2_block_size(context) / block_get_block_size());
+    buffer->lba_block += (offset / sizeof(buffer->buffer)) * (sizeof(buffer->buffer) / block_get_block_size());
+    block_read(buffer->lba_block + context->part_start, buffer->buffer);
+    return 0;
+}
+
+// static int ext2_new_buffer(struct buffer_object *buffer) {
+//     if(buffer->dirty) {
+//         ext2_store_buffer(context, buffer);
+//     }
+//     buffer->lba_block = -1;
+
+static int ext2_read_buffer(void *dest, struct buffer_object *buffer, int offset, int count) {
+    memcpy(dest, &buffer->buffer[offset % sizeof(buffer->buffer)], count);
+    return 0;
+}
+
+static int ext2_write_buffer(struct buffer_object *buffer, void *source, int offset, int count) {
+    memcpy(&buffer->buffer[offset % sizeof(buffer->buffer)], source, count);
+    buffer->dirty = 1;
+    return 0;
+}
+
+static uint32_t ext2_buffer_space(struct file_ent *fe) {
+    return ext2_block_size(fe->context) - 1 - (fe->cursor % sizeof(fe->buffer.buffer));
+}
 
 #ifdef EMBEXT_DEBUG
 void ext2_print_inode(struct inode *in) {
@@ -153,7 +195,7 @@ void ext2_print_bg1_bitmap(struct ext2context *context) {
           );
 }
 #endif /* ifdef EMBEXT_DEBUG */
-
+/*
 int ext2_flush(struct file_ent *fe) {
     if(fe->flags & EXT2_FLAG_DIRTY) {
         if(fe->sector == 0) {
@@ -167,39 +209,42 @@ int ext2_flush(struct file_ent *fe) {
         }
     }
     return 0;
-}
+}*/
 
 int ext2_flush_inode(struct file_ent *fe) {
     uint32_t inode_block;
     uint32_t block_group = (fe->inode_number - 1) / fe->context->superblock.s_inodes_per_group;
     uint32_t inode_index = (fe->inode_number - 1) % fe->context->superblock.s_inodes_per_group;
     // now load the block group descriptor for that block group
-    uint32_t bg_block = fe->context->superblock_block + 1;
+    uint32_t bg_block;
     struct block_group_descriptor *block_table;
 
     if(fe->flags & EXT2_FLAG_FS_DIRTY) {
-        ext2_flush(fe);
-        //find the inode
-  
-        bg_block <<= (fe->context->superblock.s_log_block_size + 1);
-        bg_block += ((block_group * 32) / block_get_block_size());
+        // block group descriptor table always starts immediately after the superblock
+        // it may be more than one block long but is always contiguous
+        bg_block = fe->context->superblock_block + 1;
+        bg_block += (block_group * sizeof(struct block_group_descriptor)) / ext2_block_size(fe->context);
+        
+        ext2_load_buffer(fe->context, bg_block, 
+                         (block_group * sizeof(struct block_group_descriptor)) % ext2_block_size(fe->context),
+                         &fe->buffer);
     
-        block_read(bg_block + fe->context->part_start, fe->context->sysbuf);
+        block_table = (struct block_group_descriptor *)&fe->buffer.buffer[(block_group * sizeof(struct block_group_descriptor)) % sizeof(fe->buffer.buffer)];
     
-        block_table = (struct block_group_descriptor *)&fe->context->sysbuf[(block_group * 32) % block_get_block_size()];
-    
+        // the inode table may again be more than one block but it is contiguous within each
+        // block group.  Since we're already looking at the right block group we can now treat it
+        // as contiguous.
         inode_block = block_table->bg_inode_table;
-        inode_block <<= (fe->context->superblock.s_log_block_size + 1);
-    
-        inode_block += (inode_index / (block_get_block_size() / fe->context->superblock.s_inode_size));
+        inode_block += inode_index / (ext2_block_size(fe->context) / fe->context->superblock.s_inode_size);
     
         // load the sector
-        block_read(inode_block + fe->context->part_start, fe->context->sysbuf);
-    
-        memcpy(&fe->context->sysbuf[(inode_index % (block_get_block_size() / fe->context->superblock.s_inode_size)) * fe->context->superblock.s_inode_size], &fe->inode, sizeof(struct inode));
-    
-        // write the sector
-        block_write(inode_block + fe->context->part_start, fe->context->sysbuf);
+        ext2_load_buffer(fe->context, inode_block,
+                         (inode_index * fe->context->superblock.s_inode_size) % ext2_block_size(fe->context),
+                         &fe->buffer);
+
+        ext2_write_buffer(&fe->buffer, &fe->inode, inode_index * fe->context->superblock.s_inode_size, sizeof(struct inode));
+
+        ext2_store_buffer(fe->context, &fe->buffer);
     
         fe->flags &= ~EXT2_FLAG_FS_DIRTY;
     }
@@ -454,16 +499,9 @@ int ext2_open_inode(struct file_ent *fe, int inode) {
   
     memcpy(&fe->inode, &fe->context->sysbuf[(inode_index % (block_get_block_size() / fe->context->superblock.s_inode_size)) * fe->context->superblock.s_inode_size], sizeof(struct inode));
   
-    block_read((fe->inode.i_block[0] << (fe->context->superblock.s_log_block_size + 1)) + fe->context->part_start, fe->buffer);
     fe->inode_number = inode;
     fe->flags = EXT2_FLAG_READ;
     fe->cursor = 0;
-    fe->sector = (fe->inode.i_block[0] << (fe->context->superblock.s_log_block_size + 1)) + fe->context->part_start;
-    fe->file_sector = 0;
-    fe->sectors_left = (1 << (fe->context->superblock.s_log_block_size + 1)) - 1;
-    fe->block_index[0] = 0;
-    fe->block_index[1] = 0;
-    fe->block_index[2] = 0;
   
     return 0;
 }
@@ -507,6 +545,44 @@ int ext2_lookup_path(struct file_ent *fe, const char *path, int *rerrno) {
     return ext2_open_inode(fe, ino);
 }
 
+int ext2_select_buffer(struct file_ent *fe) {
+    uint32_t block_index = fe->cursor / ext2_block_size(fe->context);
+    uint32_t block;
+    uint32_t indirect_entries = (ext2_block_size(fe->context) / 4);
+    
+    if(block_index < 12) {
+        block = fe->inode.i_block[block_index];
+    } else {
+        block_index -= 12;
+        if(block_index < indirect_entries) {
+            ext2_load_buffer(fe->context, fe->inode.i_block[12], block_index * 4, &fe->buffer);
+            ext2_read_buffer(&block, &fe->buffer, block_index * 4, 4);
+        } else {
+            block_index -= indirect_entries;
+            if(block_index < indirect_entries * indirect_entries) {
+                ext2_load_buffer(fe->context, fe->inode.i_block[13], (block_index / indirect_entries) * 4, &fe->buffer);
+                ext2_read_buffer(&block, &fe->buffer, (block_index / indirect_entries) * 4, 4);
+                ext2_load_buffer(fe->context, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
+            } else {
+                block_index -= indirect_entries * indirect_entries;
+                if(block_index < indirect_entries * indirect_entries * indirect_entries) {
+                    ext2_load_buffer(fe->context, fe->inode.i_block[14], (block_index / (indirect_entries * indirect_entries)) * 4, &fe->buffer);
+                    ext2_read_buffer(&block, &fe->buffer, (block_index / (indirect_entries * indirect_entries)) * 4, 4);
+                    ext2_load_buffer(fe->context, block, ((block_index / indirect_entries) % indirect_entries) * 4, &fe->buffer);
+                    ext2_read_buffer(&block, &fe->buffer, ((block_index / indirect_entries) % indirect_entries) * 4, 4);
+                    ext2_load_buffer(fe->context, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                    ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
+                } else {
+                    /* cursor past largest file size possible */
+                    return -1;
+                }
+            }
+        }
+    }
+    ext2_load_buffer(fe->context, block, fe->cursor % ext2_block_size(fe->context), &fe->buffer);
+}
+/*
 int ext2_next_block(struct file_ent *fe) {
   
     if(fe->block_index[0] < 11) {
@@ -536,7 +612,7 @@ int ext2_next_sector(struct file_ent *fe) {
         return 0;
     }
     return ext2_next_block(fe);
-}
+}*/
 
 /**
  * callable file access routines
@@ -612,11 +688,11 @@ int ext2_mount(blockno_t part_start, blockno_t volume_size,
         }
     }
     
-    printf("Superblocks at\n  ");
-    for(i=0;i<(*context)->num_superblocks;i++) {
-        printf("%" PRIu32 " ", (*context)->superblock_blocks[i]);
-    }
-    printf("\n");
+//     printf("\nSuperblocks at\n  ");
+//     for(i=0;i<(*context)->num_superblocks;i++) {
+//         printf("%" PRIu32 " ", (*context)->superblock_blocks[i]);
+//     }
+//     printf("\n");
 
     (*context)->superblock.s_mtime = time(NULL);
     (*context)->superblock.s_mnt_count++;
@@ -695,7 +771,6 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
         } else {
             if((flags & (O_WRONLY | O_RDWR)) == 0) {
                 /* read existing file */
-                fe->file_sector = 0;
                 return fe;
             } else {
                 /* file opened for write access, check permissions */
@@ -734,7 +809,6 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
                     free(fe);
                     return NULL;
                 }
-                fe->file_sector = 0;
                 return fe;
             }
         }
@@ -747,22 +821,22 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
 int ext2_close(void *vfe, int *rerrno) {
     struct file_ent *fe = (struct file_ent *)vfe;
     if(fe == NULL) {
-        (*rerrno) = EBADF;
+        *rerrno = EBADF;
         return -1;
     }
     if(fe->magic != EMBEXT_MAGIC) {
         *rerrno = EBADF;
         return -1;
     }
-    if(fe->flags & EXT2_FLAG_DIRTY) {
-        if(ext2_flush(fe)) {
-            (*rerrno) = EIO;
+    if(fe->buffer.dirty) {
+        if(ext2_store_buffer(fe->context, &fe->buffer)) {
+            *rerrno = EIO;
             return -1;
         }
     }
     if(fe->flags & EXT2_FLAG_FS_DIRTY) {
         if(ext2_flush_inode(fe)) {
-            (*rerrno) = EIO;
+            *rerrno = EIO;
             return -1;
         }
     }
@@ -774,6 +848,7 @@ int ext2_close(void *vfe, int *rerrno) {
 int ext2_read(void *vfe, void *buffer, size_t count, int *rerrno) {
     struct file_ent *fe = (struct file_ent *)vfe;
     uint32_t i=0;
+    uint32_t amount_to_copy;
     uint8_t *bt = (uint8_t *)buffer;
     /* make sure this is an open file and it can be read */  
     if(fe == NULL) {
@@ -786,15 +861,18 @@ int ext2_read(void *vfe, void *buffer, size_t count, int *rerrno) {
     }
     /* copy some bytes to the buffer requested */
     while(i < count) {
-        if(((fe->cursor + fe->file_sector * block_get_block_size())) >= fe->inode.i_size) {
+        if(fe->cursor >= fe->inode.i_size) {
             break;   /* end of file */
         }
-        *bt++ = *(uint8_t *)(fe->buffer + fe->cursor);
-        fe->cursor++;
-        if(fe->cursor == (uint32_t)block_get_block_size()) {
-            ext2_next_sector(fe);
-        }
-        i++;
+        /* check the right part of the right block is in the buffer (might not be e.g. after a seek */
+        ext2_select_buffer(fe);
+        amount_to_copy = ((count - i) > ext2_buffer_space(fe)) ?
+                                    ext2_buffer_space(fe) : (count - i);
+        amount_to_copy = (amount_to_copy > (fe->inode.i_size - fe->cursor)) ?
+                                    (fe->inode.i_size - fe->cursor) : amount_to_copy;
+        ext2_read_buffer(&bt[i], &fe->buffer, fe->cursor % ext2_block_size(fe->context), amount_to_copy);
+        fe->cursor += amount_to_copy;
+        i += amount_to_copy;
     }
     if(i > 0) {
         ext2_update_atime(fe);
@@ -806,6 +884,7 @@ int ext2_write(void *vfe, const void *buffer, size_t count,
                int *rerrno) {
     struct file_ent *fe = (struct file_ent *)vfe;
     uint32_t i=0;
+    uint32_t amount_to_copy;
     uint8_t *bt = (uint8_t *)buffer;
     if(fe == NULL) {
         (*rerrno) = EBADF;
@@ -825,19 +904,18 @@ int ext2_write(void *vfe, const void *buffer, size_t count,
         }
     }
     while(i < count) {
-        if(((fe->cursor + fe->file_sector * 512)) == fe->inode.i_size) {
-            fe->inode.i_size++;
-            fe->flags |= EXT2_FLAG_DIRTY;
+        /* make sure the right buffer is loaded */
+        ext2_select_buffer(fe);
+        
+        amount_to_copy = ((count - i) > ext2_buffer_space(fe)) ?
+                                ext2_buffer_space(fe) : (count - i);
+        ext2_write_buffer(&fe->buffer, &bt[i], fe->cursor % ext2_block_size(fe->context), amount_to_copy);
+        fe->cursor += amount_to_copy;
+        i += amount_to_copy;
+        if(fe->cursor > fe->inode.i_size) {
+            fe->inode.i_size = fe->cursor;
+            fe->flags |= EXT2_FLAG_FS_DIRTY;
         }
-        fe->buffer[fe->cursor] = *bt++;
-        fe->cursor++;
-        if(fe->cursor == 512) {
-            if(ext2_next_sector(fe)) {
-                (*rerrno) = EIO;
-                return -1;
-            }
-        }
-        i++;
     }
     if(i > 0) {
         ext2_update_mtime(fe);
@@ -876,76 +954,122 @@ int ext2_fstat(void *vfe, struct stat *st,
     return 0; 
 }
 
-int ext2_lseek(void *vfe, int ptr, int dir,
-               int *rerrno) {
+int ext2_lseek(void *vfe, int offset, int whence, int *rerrno) {
     struct file_ent *fe = (struct file_ent *)vfe;
-    unsigned int new_pos;
-    unsigned int old_pos;
-    int new_sec;
-    uint32_t block;
-    (*rerrno) = 0;
-
+    
     if(fe == NULL) {
-        (*rerrno) = EBADF;
-        return ptr-1;
+        *rerrno = EBADF;
+        return -1;
     }
-    old_pos = fe->file_sector * block_get_block_size() + fe->cursor;
-  
-    if(dir == SEEK_SET) {
-        new_pos = ptr;
-    } else if(dir == SEEK_CUR) {
-        new_pos = fe->file_sector * block_get_block_size() + fe->cursor + ptr;
-    } else {
-        new_pos = fe->inode.i_size + ptr;
+    if(fe->magic != EMBEXT_MAGIC) {
+        *rerrno = EBADF;
+        return -1;
     }
-    if(old_pos == new_pos) {
-        // if the offset was, or effectively would be zero, just say where we are
-        return old_pos;
-    }
-  
-    // TODO: support seeking past the end on writeable files
-    if(new_pos > fe->inode.i_size) {
-        return ptr-1; /* tried to seek outside a file */
-    }
-    // optimisation cases
-    if((old_pos/block_get_block_size()) == (new_pos/block_get_block_size())) {
-        // case 1: seekin  (*rerrno) = 0;
-        fe->cursor = new_pos % block_get_block_size();
-        return new_pos;
-    } else if((new_pos / (1 << (fe->context->superblock.s_log_block_size + 10))) == (old_pos / (1 << (fe->context->superblock.s_log_block_size + 10)))) {
-    // case 2: seeking within the cluster, just need to hop forward/back some sectors
-        ext2_flush(fe);       // need to flush before loading a new sector
-        fe->file_sector = new_pos / block_get_block_size();
-        fe->sector = fe->sector + (new_pos/block_get_block_size()) - (old_pos/block_get_block_size());
-        fe->sectors_left = fe->sectors_left + (new_pos/block_get_block_size()) - (old_pos/block_get_block_size());
-        fe->cursor = new_pos % block_get_block_size();
-        if(block_read(fe->sector, fe->buffer)) {
-            return ptr - 1;
+    
+    if(whence == SEEK_SET) {
+        if(offset < 0) {
+            /* shall fail with EINVAL if the resulting offset would be negative */
+            *rerrno = EINVAL;
+            return -1;
         }
-        return new_pos;
+        fe->cursor = offset;
+    } else if(whence == SEEK_CUR) {
+        if(offset > INT64_MAX - fe->cursor) {
+            /* shall fail with EOVERFLOW if the resulting offset would cause cursor to wrap */
+            *rerrno = EOVERFLOW;
+            return -1;
+        }
+        if(offset + fe->cursor < 0) {
+            /* shall fail with EINVAL if the resulting offset would be negative */
+            *rerrno = EINVAL;
+            return -1;
+        }
+        fe->cursor += offset;
+    } else if(whence == SEEK_END) {
+        if(offset > INT64_MAX - fe->inode.i_size) {
+            *rerrno = EOVERFLOW;
+            return -1;
+        }
+        if(offset + (int64_t)fe->inode.i_size < 0) {
+            *rerrno = EINVAL;
+            return -1;
+        }
+        fe->cursor = fe->inode.i_size + offset;
+    } else {
+        /* shall fail with EINVAL if the whence argument is not valid */
+        *rerrno = EINVAL;
+        return -1;
     }
-    ext2_flush(fe);
-    // otherwise we need to seek the cluster chain
-    block = new_pos / (1 << (fe->context->superblock.s_log_block_size + 10));
-  
-    if(block > 11) {
-        printf("Uh oh, indirect block :(\r\n");
-        return ptr-1;
-    }
-    fe->block_index[0] = block;
-  
-    fe->file_sector = new_pos / block_get_block_size();
-    fe->cursor = new_pos % block_get_block_size();
-    new_sec = new_pos - block * (1 << (fe->context->superblock.s_log_block_size + 10));
-    new_sec = new_sec / block_get_block_size();
-    fe->sector = fe->inode.i_block[fe->block_index[0]] * (1 << (fe->context->superblock.s_log_block_size + 1)) + fe->context->part_start + new_sec;
-    fe->sectors_left = (1 << (fe->context->superblock.s_log_block_size + 1)) - new_sec - 1;
-    if(block_read(fe->sector, fe->buffer)) {
-        return ptr-1;
-//     iprintf("Bad block read 2.\r\n");
-    }
-    return new_pos;
+    
+    return fe->cursor;
 }
+//     unsigned int new_pos;
+//     unsigned int old_pos;
+//     int new_sec;
+//     uint32_t block;
+//     (*rerrno) = 0;
+// 
+//     if(fe == NULL) {
+//         (*rerrno) = EBADF;
+//         return ptr-1;
+//     }
+//     old_pos = fe->file_sector * block_get_block_size() + fe->cursor;
+//   
+//     if(dir == SEEK_SET) {
+//         new_pos = ptr;
+//     } else if(dir == SEEK_CUR) {
+//         new_pos = fe->file_sector * block_get_block_size() + fe->cursor + ptr;
+//     } else {
+//         new_pos = fe->inode.i_size + ptr;
+//     }
+//     if(old_pos == new_pos) {
+//         // if the offset was, or effectively would be zero, just say where we are
+//         return old_pos;
+//     }
+//   
+//     // TODO: support seeking past the end on writeable files
+//     if(new_pos > fe->inode.i_size) {
+//         return ptr-1; /* tried to seek outside a file */
+//     }
+//     // optimisation cases
+//     if((old_pos/block_get_block_size()) == (new_pos/block_get_block_size())) {
+//         // case 1: seekin  (*rerrno) = 0;
+//         fe->cursor = new_pos % block_get_block_size();
+//         return new_pos;
+//     } else if((new_pos / (1 << (fe->context->superblock.s_log_block_size + 10))) == (old_pos / (1 << (fe->context->superblock.s_log_block_size + 10)))) {
+//     // case 2: seeking within the cluster, just need to hop forward/back some sectors
+//         ext2_flush(fe);       // need to flush before loading a new sector
+//         fe->file_sector = new_pos / block_get_block_size();
+//         fe->sector = fe->sector + (new_pos/block_get_block_size()) - (old_pos/block_get_block_size());
+//         fe->sectors_left = fe->sectors_left + (new_pos/block_get_block_size()) - (old_pos/block_get_block_size());
+//         fe->cursor = new_pos % block_get_block_size();
+//         if(block_read(fe->sector, fe->buffer)) {
+//             return ptr - 1;
+//         }
+//         return new_pos;
+//     }
+//     ext2_flush(fe);
+//     // otherwise we need to seek the cluster chain
+//     block = new_pos / (1 << (fe->context->superblock.s_log_block_size + 10));
+//   
+//     if(block > 11) {
+//         printf("Uh oh, indirect block :(\r\n");
+//         return ptr-1;
+//     }
+//     fe->block_index[0] = block;
+//   
+//     fe->file_sector = new_pos / block_get_block_size();
+//     fe->cursor = new_pos % block_get_block_size();
+//     new_sec = new_pos - block * (1 << (fe->context->superblock.s_log_block_size + 10));
+//     new_sec = new_sec / block_get_block_size();
+//     fe->sector = fe->inode.i_block[fe->block_index[0]] * (1 << (fe->context->superblock.s_log_block_size + 1)) + fe->context->part_start + new_sec;
+//     fe->sectors_left = (1 << (fe->context->superblock.s_log_block_size + 1)) - new_sec - 1;
+//     if(block_read(fe->sector, fe->buffer)) {
+//         return ptr-1;
+// //     iprintf("Bad block read 2.\r\n");
+//     }
+//     return new_pos;
+// }
 
 int ext2_isatty(void *vfe, int *rerrno) {
     struct file_ent *fe = (struct file_ent *)vfe;

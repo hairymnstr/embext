@@ -47,17 +47,18 @@ void block_pc_set_image_name(const char * const filename) {
 int block_init() {
   FILE *block_fp;
   if(!(block_fp = fopen(image_name, "rb"))) {
+    fprintf(stderr, "\nFailed to open filesystem image, does it exist?\n");
     return -1;
   }
   fseek(block_fp, 0, SEEK_END);
   block_fs_size = ftell(block_fp);
   if(!(block_fs_size < 2048L * 1024L * 1024L)) {
-    fprintf(stderr, "Aborting, image is over 2GB.\n");
+    fprintf(stderr, "\nAborting, image is over 2GB.\n");
     fclose(block_fp);
     return -1;
   }
   if((blocks = (uint8_t *)malloc(sizeof(uint8_t) * block_fs_size)) == NULL) {
-      fprintf(stderr, "Failed to malloc() enough memory for the filesystem.\r\n");
+      fprintf(stderr, "\nFailed to malloc() enough memory for the filesystem.\n");
       fclose(block_fp);
       return -1;
   }
@@ -65,7 +66,7 @@ int block_init() {
   fseek(block_fp, 0, SEEK_SET);
   if(fread(blocks, 1, block_fs_size, block_fp) < block_fs_size) {
       free(blocks);
-      fprintf(stderr, "Failed to read the filesystem image.\n");
+      fprintf(stderr, "\nFailed to read the filesystem image.\n");
       return -1;
   }
   

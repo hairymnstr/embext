@@ -86,6 +86,7 @@ struct block_group_descriptor {
     uint16_t bg_free_inodes_count;
     uint16_t bg_used_dirs_count;
     uint16_t bg_pad;
+    uint8_t  bg_reserved[12];
 } __attribute__((__packed__));
 
 struct inode {
