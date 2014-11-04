@@ -460,6 +460,92 @@ uint32_t ext2_allocate_block(struct ext2context *context, uint32_t previous_bloc
     
     return 0;
 }
+    
+int ext2_truncate_file(struct file_ent *fe) {
+    int i,j,k;
+    uint32_t block, block2, block3;
+    int32_t indirect_entries = ext2_block_size(fe->context) / 4;
+    int isdir = (fe->inode.i_mode & EXT2_S_IFDIR) ? 1 : 0;
+    for(i=0;i<12;i++) {
+        if(fe->inode.i_block[i]) {
+            ext2_change_allocated(fe->context, fe->inode.i_block[i], EXT2_DEALLOCATED, isdir);
+        }
+        fe->inode.i_block[i] = 0;
+    }
+    if(fe->inode.i_block[12]) {
+        // indirect blocks
+        for(i=0;i<indirect_entries;i++) {
+            ext2_load_buffer(fe->context, fe->inode.i_block[12], i * 4, &fe->buffer);
+            ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
+            if(block) {
+                ext2_change_allocated(fe->context, block, EXT2_DEALLOCATED, isdir);
+            } else {
+                break;
+            }
+        }
+        // finally free the indirect block
+        ext2_change_allocated(fe->context, fe->inode.i_block[12], EXT2_DEALLOCATED, isdir);
+        fe->inode.i_block[12] = 0;
+    }
+    if(fe->inode.i_block[13]) {
+        // double indirect blocks
+        for(i=0;i<indirect_entries;i++) {
+            ext2_load_buffer(fe->context, fe->inode.i_block[13], i *4, &fe->buffer);
+            ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
+            if(block) {
+                for(j=0;j<indirect_entries;j++) {
+                    ext2_load_buffer(fe->context, block, j * 4, &fe->buffer);
+                    ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
+                    if(block2) {
+                        ext2_change_allocated(fe->context, block2, EXT2_DEALLOCATED, isdir);
+                    } else {
+                        break;
+                    }
+                }
+                ext2_change_allocated(fe->context, block, EXT2_DEALLOCATED, isdir);
+            } else {
+                break;
+            }
+        }
+        ext2_change_allocated(fe->context, fe->inode.i_block[13], EXT2_DEALLOCATED, isdir);
+        fe->inode.i_block[13] = 0;
+    }
+    if(fe->inode.i_block[14]) {
+        // triply indirect blocks
+        for(i=0;i<indirect_entries;i++) {
+            ext2_load_buffer(fe->context, fe->inode.i_block[13], i * 4, &fe->buffer);
+            ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
+            if(block) {
+                for(j=0;j<indirect_entries;j++) {
+                    ext2_load_buffer(fe->context, block, j * 4, &fe->buffer);
+                    ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
+                    if(block2) {
+                        for(k=0;k<indirect_entries;k++) {
+                            ext2_load_buffer(fe->context, block, k * 4, &fe->buffer);
+                            ext2_read_buffer(&block3, &fe->buffer, k * 4, 4);
+                            if(block3) {
+                                ext2_change_allocated(fe->context, block3, EXT2_DEALLOCATED, isdir);
+                            } else {
+                                break;
+                            }
+                        }
+                        ext2_change_allocated(fe->context, block2, EXT2_DEALLOCATED, isdir);
+                    } else {
+                        break;
+                    }
+                }
+                ext2_change_allocated(fe->context, block, EXT2_DEALLOCATED, isdir);
+            } else {
+                break;
+            }
+        }
+        ext2_change_allocated(fe->context, fe->inode.i_block[14], EXT2_DEALLOCATED, isdir);
+        fe->inode.i_block[14] = 0;
+    }
+    fe->inode.i_size = 0;
+    fe->inode.i_blocks = 0;
+    return 0;
+}
 
 int ext2_update_atime(struct file_ent *fe) {
     fe->inode.i_atime = time(NULL);
@@ -614,16 +700,16 @@ int ext2_next_sector(struct file_ent *fe) {
     return ext2_next_block(fe);
 }*/
 
-/**
- * callable file access routines
- */
-
 int is_power(int x, int ofy) {
     while((x % ofy ) == 0) {
         x /= ofy;
     }
     return x == 1;
 }
+
+/**
+ * callable file access routines
+ */
 
 int ext2_mount(blockno_t part_start, blockno_t volume_size, 
                uint8_t filesystem_hint __attribute__((__unused__)), /* don't trust partition table */
@@ -748,6 +834,7 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
         /* file doesn't exist */
         if((flags & (O_CREAT)) == 0) {
             /* tried to open a non-existent file with no create */
+            fe->magic = 0;
             free(fe);
             (*rerrno) = ENOENT;
             return NULL;
@@ -755,18 +842,13 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
             /* opening a new file for writing */
             /* only create files in directories that aren't read only */
             if(fe->context->read_only) {
+                fe->magic = 0;
                 free(fe);
                 (*rerrno) = EROFS;
                 return NULL;
             }
-            /* create an empty file structure ready for use */
-            printf("Not implemented, making a new file\r\n");
-            free(fe);
-            return NULL;
-      
-//       file_num[fd].flags |= FAT_FLAG_FS_DIRTY;
-//       (*rerrno) = 0;    /* file not found but we're aloud to create it so success */
-//       return fd;
+            /* all fields are zero, including inode number so a file will be created upon write */
+            return fe;
         }
     } else if(i == 0) {
         /* file does exist */
@@ -801,20 +883,9 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
                     return NULL;
                 }
                 if(flags & O_TRUNC) {
-          /* Need to truncate the file to zero length */
-//           fat_free_clusters(file_num[fd].full_first_cluster);
-//           file_num[fd].size = 0;
-//           file_num[fd].full_first_cluster = 0;
-//           file_num[fd].sector = 0;
-//           file_num[fd].cluster = 0;
-//           file_num[fd].sectors_left = 0;
-//           file_num[fd].file_sector = 0;
-//           file_num[fd].created = time(NULL);
-//           file_num[fd].modified = time(NULL);
-//           file_num[fd].flags |= FAT_FLAG_FS_DIRTY;
-                    printf("Not implemented, O_TRUNC\r\n");
-                    free(fe);
-                    return NULL;
+                    /* Need to truncate the file to zero length */
+                    ext2_truncate_file(fe);
+                    fe->cursor = 0;
                 }
                 return fe;
             }
@@ -946,18 +1017,14 @@ int ext2_fstat(void *vfe, struct stat *st,
     st->st_mode = fe->inode.i_mode;
     st->st_nlink = fe->inode.i_links_count;   /* number of hard links to the file */
     st->st_uid = fe->inode.i_uid;
-    st->st_gid = fe->inode.i_gid;     /* not implemented on FAT */
+    st->st_gid = fe->inode.i_gid;
     st->st_rdev = 0;
     st->st_size = fe->inode.i_size;
-    /* should be seconds since epoch. */
     st->st_atime = fe->inode.i_atime;
     st->st_mtime = fe->inode.i_mtime;
     st->st_ctime = fe->inode.i_ctime;
-    st->st_blksize = 1 << (fe->context->superblock.s_log_block_size + 10);
-    st->st_blocks = (fe->inode.i_size / (1 << (fe->context->superblock.s_log_block_size + 10)));  /* number of blocks allocated for this object */
-    if(fe->inode.i_size % (1 << (fe->context->superblock.s_log_block_size + 10))) {
-        st->st_blocks++;
-    }
+    st->st_blksize = ext2_block_size(fe->context);
+    st->st_blocks = fe->inode.i_blocks;
     return 0; 
 }
 
