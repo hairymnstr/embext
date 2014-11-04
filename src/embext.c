@@ -288,16 +288,16 @@ int ext2_get_bg_descriptor(struct ext2context *context,
     lba_block = context->superblock_block + 1;
 
     // the table is contiguous so convert to disk blocks here
-    lba_block <<= (context->superblock.s_log_block_size + 1);
+    lba_block *= ext2_block_size(context) / block_get_block_size();
     
     // now find the disk-block offset
-    lba_block += (block_group / (512 / 32));
+    lba_block += block_group / (block_get_block_size() / sizeof(struct block_group_descriptor));
     
     block_read(lba_block + context->part_start, context->sysbuf);
     
     // copy the appropriate chunk from the buffer
     memcpy(bg, 
-           &context->sysbuf[32 * (block_group % (512 / 32))], 
+           &context->sysbuf[sizeof(struct block_group_descriptor) * (block_group % (block_get_block_size() / sizeof(struct block_group_descriptor)))], 
            sizeof(struct block_group_descriptor));
     
     return 0;
@@ -330,15 +330,15 @@ int ext2_write_bg_descriptor(struct ext2context *context,
         lba_block = context->superblock_blocks[i] + 1;
         
         // convert to lba disk blocks
-        lba_block <<= (context->superblock.s_log_block_size + 1);
+        lba_block *= ext2_block_size(context) / block_get_block_size();
         
         // step along to the disk block containing this descriptor
-        lba_block += (block_group / (512 / 32));
+        lba_block += (block_group / (block_get_block_size() / sizeof(struct block_group_descriptor)));
         
         block_read(lba_block + context->part_start, context->sysbuf);
         
         // copy the descriptor to the table
-        memcpy(&context->sysbuf[32 * (block_group % (512 / 32))],
+        memcpy(&context->sysbuf[sizeof(struct block_group_descriptor) * (block_group % (block_get_block_size() / sizeof(struct block_group_descriptor)))],
                bg,
                sizeof(struct block_group_descriptor));
     }
@@ -696,14 +696,21 @@ int ext2_mount(blockno_t part_start, blockno_t volume_size,
 
     (*context)->superblock.s_mtime = time(NULL);
     (*context)->superblock.s_mnt_count++;
-    
-    if((*context)->superblock.s_mnt_count > (*context)->superblock.s_max_mnt_count) {
-        printf("Should run e2fsck\n");
+    if((*context)->superblock.s_state == EXT2_ERROR_FS) {
+        printf("Not properly unmounted, should run e2fsck\n");
+    } else if((*context)->superblock.s_mnt_count > (*context)->superblock.s_max_mnt_count) {
+        printf("Routine maintenance, should run e2fsck\n");
     }
+    (*context)->superblock.s_state = EXT2_ERROR_FS;
+    
+    /* mount count and the fact that the filesystem is currently mounted should be written to
+     * disk immediately. */
+    ext2_flush_superblock((*context));
     return 0;
 }
 
 int ext2_umount(struct ext2context *context) {
+    context->superblock.s_state = EXT2_VALID_FS;
     ext2_flush_superblock(context);
     
     free(context->superblock_blocks);

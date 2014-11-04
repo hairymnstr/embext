@@ -5,6 +5,10 @@
 #define MAX_PATH_LEVELS 100
 
 #define EXT2_SUPER_MAGIC 0xEF53
+
+#define EXT2_VALID_FS   1
+#define EXT2_ERROR_FS   2
+
 // reserved inode definitions
 #define EXT2_BAD_INO 1
 #define EXT2_ROOT_INO 2
