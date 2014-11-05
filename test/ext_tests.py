@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import sys, os, subprocess
+import sys, os, subprocess, hashlib
 from PIL import Image, ImageDraw
 
 force_create = False
@@ -30,13 +30,20 @@ if not os.path.isdir("temp/static"):
     pr = subprocess.Popen(["sudo", "chmod", "0777", "temp/static"])
     pr.wait()
 
-if not os.path.exists("temp/static/testimg.png"):
+if not os.path.exists("temp/static/test_image.png"):
     print "Creating a test image"
     image = Image.new('RGBA', (640, 480))
     draw = ImageDraw.Draw(image)
     draw.ellipse((120, 40, 520, 440), fill = 'blue', outline = 'blue')
     print "Saving to test file system"
     image.save("temp/static/test_image.png")
+    fr = open("temp/static/test_image.png", "rb")
+    m = hashlib.md5()
+    m.update(fr.read())
+    fr.close()
+    fw = open("test_image.md5", "wb")
+    fw.write(m.digest())
+    fw.close()
 
 if not os.path.exists("temp/logs"):
     print "Creating log folder"

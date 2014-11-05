@@ -43,6 +43,9 @@ struct md_context {
   uint8_t buffer[64];
 };
 
+void md5_start(struct md_context *context);
+void md5_update(struct md_context *context, uint8_t *data, uint64_t length);
+void md5_finish(struct md_context *context);
 int md5_file(const char *path, uint8_t hash[16]);
 int md5_memory(const void *mem, uint64_t len, uint8_t hash[16]);
 

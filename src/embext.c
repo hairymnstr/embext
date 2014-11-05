@@ -49,7 +49,8 @@
 struct buffer_object {
     uint8_t buffer[512];
     uint32_t lba_block;
-    uint32_t dirty;
+    uint16_t dirty;
+    uint16_t stored;
 };
 
 struct file_ent {
@@ -63,27 +64,42 @@ struct file_ent {
 };
 
 
-static int ext2_store_buffer(struct ext2context *context, struct buffer_object *buffer) {
-    block_write(buffer->lba_block + context->part_start, buffer->buffer);
-    buffer->dirty = 0;
-    return 0;
-}
-
-static int ext2_load_buffer(struct ext2context *context, uint32_t block_number, uint32_t offset, struct buffer_object *buffer) {
-    if(buffer->dirty) {
-        ext2_store_buffer(context, buffer);
+static int ext2_store_buffer(struct file_ent *fe, struct buffer_object *buffer) {
+    if(buffer->stored) {
+        // flushing a modified block back to disk
+        block_write(buffer->lba_block + fe->context->part_start, buffer->buffer);
+        buffer->dirty = 0;
+    } else {
+        // this is a new block so needs to be allocated first
+        printf("Allocat: failed\n");
     }
-    buffer->lba_block = block_number * (ext2_block_size(context) / block_get_block_size());
-    buffer->lba_block += (offset / sizeof(buffer->buffer)) * (sizeof(buffer->buffer) / block_get_block_size());
-    block_read(buffer->lba_block + context->part_start, buffer->buffer);
     return 0;
 }
 
-// static int ext2_new_buffer(struct buffer_object *buffer) {
-//     if(buffer->dirty) {
-//         ext2_store_buffer(context, buffer);
-//     }
-//     buffer->lba_block = -1;
+static int ext2_load_buffer(struct file_ent *fe, uint32_t block_number, uint32_t offset, struct buffer_object *buffer) {
+    if(buffer->dirty) {
+        ext2_store_buffer(fe, buffer);
+    }
+    buffer->lba_block = block_number * (ext2_block_size(fe->context) / block_get_block_size());
+    buffer->lba_block += (offset / sizeof(buffer->buffer)) * (sizeof(buffer->buffer) / block_get_block_size());
+    block_read(buffer->lba_block + fe->context->part_start, buffer->buffer);
+    // mark this as a valid on-disk buffer that just needs to be flushed not allocated
+    buffer->stored = 1;
+    return 0;
+}
+
+static int ext2_new_buffer(struct file_ent *fe, struct buffer_object *buffer) {
+    if(buffer->dirty) {
+        ext2_store_buffer(fe, buffer);
+    }
+    // new parts of files are always zero
+    // don't mark as dirty until some data has actually been written here
+    memset(buffer->buffer, 0, sizeof(buffer->buffer));
+    // mark this buffer as unstored so that a new block will be allocated when store() is called
+    buffer->stored = 0;
+    return 0;
+}
+    
 
 static int ext2_read_buffer(void *dest, struct buffer_object *buffer, int offset, int count) {
     memcpy(dest, &buffer->buffer[offset % sizeof(buffer->buffer)], count);
@@ -225,7 +241,7 @@ int ext2_flush_inode(struct file_ent *fe) {
         bg_block = fe->context->superblock_block + 1;
         bg_block += (block_group * sizeof(struct block_group_descriptor)) / ext2_block_size(fe->context);
         
-        ext2_load_buffer(fe->context, bg_block, 
+        ext2_load_buffer(fe, bg_block, 
                          (block_group * sizeof(struct block_group_descriptor)) % ext2_block_size(fe->context),
                          &fe->buffer);
     
@@ -238,13 +254,13 @@ int ext2_flush_inode(struct file_ent *fe) {
         inode_block += inode_index / (ext2_block_size(fe->context) / fe->context->superblock.s_inode_size);
     
         // load the sector
-        ext2_load_buffer(fe->context, inode_block,
+        ext2_load_buffer(fe, inode_block,
                          (inode_index * fe->context->superblock.s_inode_size) % ext2_block_size(fe->context),
                          &fe->buffer);
 
         ext2_write_buffer(&fe->buffer, &fe->inode, inode_index * fe->context->superblock.s_inode_size, sizeof(struct inode));
 
-        ext2_store_buffer(fe->context, &fe->buffer);
+        ext2_store_buffer(fe, &fe->buffer);
     
         fe->flags &= ~EXT2_FLAG_FS_DIRTY;
     }
@@ -475,7 +491,7 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[12]) {
         // indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe->context, fe->inode.i_block[12], i * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[12], i * 4, &fe->buffer);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 ext2_change_allocated(fe->context, block, EXT2_DEALLOCATED, isdir);
@@ -490,11 +506,11 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[13]) {
         // double indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe->context, fe->inode.i_block[13], i *4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[13], i *4, &fe->buffer);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 for(j=0;j<indirect_entries;j++) {
-                    ext2_load_buffer(fe->context, block, j * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, j * 4, &fe->buffer);
                     ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
                     if(block2) {
                         ext2_change_allocated(fe->context, block2, EXT2_DEALLOCATED, isdir);
@@ -513,15 +529,15 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[14]) {
         // triply indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe->context, fe->inode.i_block[13], i * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[13], i * 4, &fe->buffer);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 for(j=0;j<indirect_entries;j++) {
-                    ext2_load_buffer(fe->context, block, j * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, j * 4, &fe->buffer);
                     ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
                     if(block2) {
                         for(k=0;k<indirect_entries;k++) {
-                            ext2_load_buffer(fe->context, block, k * 4, &fe->buffer);
+                            ext2_load_buffer(fe, block, k * 4, &fe->buffer);
                             ext2_read_buffer(&block3, &fe->buffer, k * 4, 4);
                             if(block3) {
                                 ext2_change_allocated(fe->context, block3, EXT2_DEALLOCATED, isdir);
@@ -641,23 +657,23 @@ int ext2_select_buffer(struct file_ent *fe) {
     } else {
         block_index -= 12;
         if(block_index < indirect_entries) {
-            ext2_load_buffer(fe->context, fe->inode.i_block[12], block_index * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[12], block_index * 4, &fe->buffer);
             ext2_read_buffer(&block, &fe->buffer, block_index * 4, 4);
         } else {
             block_index -= indirect_entries;
             if(block_index < indirect_entries * indirect_entries) {
-                ext2_load_buffer(fe->context, fe->inode.i_block[13], (block_index / indirect_entries) * 4, &fe->buffer);
+                ext2_load_buffer(fe, fe->inode.i_block[13], (block_index / indirect_entries) * 4, &fe->buffer);
                 ext2_read_buffer(&block, &fe->buffer, (block_index / indirect_entries) * 4, 4);
-                ext2_load_buffer(fe->context, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4, &fe->buffer);
                 ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
             } else {
                 block_index -= indirect_entries * indirect_entries;
                 if(block_index < indirect_entries * indirect_entries * indirect_entries) {
-                    ext2_load_buffer(fe->context, fe->inode.i_block[14], (block_index / (indirect_entries * indirect_entries)) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, fe->inode.i_block[14], (block_index / (indirect_entries * indirect_entries)) * 4, &fe->buffer);
                     ext2_read_buffer(&block, &fe->buffer, (block_index / (indirect_entries * indirect_entries)) * 4, 4);
-                    ext2_load_buffer(fe->context, block, ((block_index / indirect_entries) % indirect_entries) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, ((block_index / indirect_entries) % indirect_entries) * 4, &fe->buffer);
                     ext2_read_buffer(&block, &fe->buffer, ((block_index / indirect_entries) % indirect_entries) * 4, 4);
-                    ext2_load_buffer(fe->context, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4, &fe->buffer);
                     ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
                 } else {
                     /* cursor past largest file size possible */
@@ -666,7 +682,16 @@ int ext2_select_buffer(struct file_ent *fe) {
             }
         }
     }
-    ext2_load_buffer(fe->context, block, fe->cursor % ext2_block_size(fe->context), &fe->buffer);
+    if(block) {
+        ext2_load_buffer(fe, block, fe->cursor % ext2_block_size(fe->context), &fe->buffer);
+    } else {
+        if(fe->flags & EXT2_FLAG_WRITE) {
+            ext2_new_buffer(fe, &fe->buffer);
+        } else {
+            return -1;
+        }
+    }
+    return 0;
 }
 /*
 int ext2_next_block(struct file_ent *fe) {
@@ -907,7 +932,7 @@ int ext2_close(void *vfe, int *rerrno) {
         return -1;
     }
     if(fe->buffer.dirty) {
-        if(ext2_store_buffer(fe->context, &fe->buffer)) {
+        if(ext2_store_buffer(fe, &fe->buffer)) {
             *rerrno = EIO;
             return -1;
         }
@@ -943,7 +968,10 @@ int ext2_read(void *vfe, void *buffer, size_t count, int *rerrno) {
             break;   /* end of file */
         }
         /* check the right part of the right block is in the buffer (might not be e.g. after a seek */
-        ext2_select_buffer(fe);
+        if(ext2_select_buffer(fe)) {
+            *rerrno = EIO;
+            return -1;
+        }
         amount_to_copy = ((count - i) > ext2_buffer_space(fe)) ?
                                     ext2_buffer_space(fe) : (count - i);
         amount_to_copy = (amount_to_copy > (fe->inode.i_size - fe->cursor)) ?
@@ -983,7 +1011,10 @@ int ext2_write(void *vfe, const void *buffer, size_t count,
     }
     while(i < count) {
         /* make sure the right buffer is loaded */
-        ext2_select_buffer(fe);
+        if(ext2_select_buffer(fe)) {
+            *rerrno = EIO;
+            return -1;
+        }
         
         amount_to_copy = ((count - i) > ext2_buffer_space(fe)) ?
                                 ext2_buffer_space(fe) : (count - i);

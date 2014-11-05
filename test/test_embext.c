@@ -4,17 +4,22 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "hash.h"
 #include "dirent.h"
 #include "block_pc.h"
 #include "block.h"
 #include "embext.h"
 
 int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unused__))) {
-  int p = 0;
+  int p = 0, r;
   int result;
   char buffer[256];
+  struct md_context hash_context;
+  uint8_t real_hash[16];
   struct stat st;
   struct ext2context *context;
+  FILE *fhash;
+  
   printf("Running EXT2 tests...\n\n");
   block_pc_set_image_name("testext.img");
   printf("[%4d] start block device emulation...", p++);
@@ -28,7 +33,7 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
   
   result = ext2_mount(0, block_get_volume_size(), 0, &context);
 
-  printf("   %d\n", result);
+  printf("    %d\n", result);
   
   printf("[%4d] open root folder", p++);
   void *fe = ext2_open(context, "/", O_RDONLY, 0777, &result);
@@ -66,19 +71,45 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
   }
   ext2_close(fe, &result);
   
+  printf("[%4d] read binary file", p++);
   FILE *fw = fopen("dump.png", "wb");
-  fe = ext2_open(context, "/static/test_image.png", O_RDONLY, 0777, &result);
-  printf("%p\n", fe);
-  while((p = ext2_read(fe, &buffer, sizeof(buffer), &result)) == sizeof(buffer)) {
-    fwrite(buffer, 1, p, fw);
+  if(!(fe = ext2_open(context, "/static/test_image.png", O_RDONLY, 0777, &result))) {
+      printf("    fail [%d] %s\n", result, strerror(result));
+      exit(1);
   }
-  if(p > 0) {
-    fwrite(buffer, 1, p, fw);
+  
+  md5_start(&hash_context);
+  while((r = ext2_read(fe, &buffer, sizeof(buffer), &result)) == sizeof(buffer)) {
+    fwrite(buffer, 1, r, fw);
+    md5_update(&hash_context, (uint8_t *)buffer, r);
+  }
+  if(r > 0) {
+    fwrite(buffer, 1, r, fw);
+    md5_update(&hash_context, (uint8_t *)buffer, r);
   }
   fclose(fw);
   ext2_close(fe, &result);
   
-  printf("\nWrite test...\n\n");
+  md5_finish(&hash_context);
+  if(!(fhash = fopen("test_image.md5", "rb"))) {
+      printf("\nCouldn't open md5 sum of image for verification\n");
+      printf("Have you run the latest version of ext_tests.py?\n");
+      exit(1);
+  }
+  if(fread(real_hash, 1, 16, fhash) != 16) {
+      printf("Couldn't read hash from hash file.  Can't verify image\n");
+      exit(1);
+  }
+  fclose(fhash);
+  
+  if(memcmp(hash_context.digest, real_hash, 16)) {
+      printf("    fail, bad hash\n");
+  } else {
+      printf("    pass\n");
+  }
+
+  printf("[%4d] write test", p++);
+  fflush(stdout);
   
   fe = ext2_open(context, "/logs/test.txt", O_WRONLY | O_APPEND, 0777, &result);
   if(fe == NULL) {
@@ -86,10 +117,15 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
       exit(-1);
   }
   
-  ext2_write(fe, "Hello world\r\n", 13, &result);
-  
+  r = ext2_write(fe, "Hello world\r\n", 13, &result);
+  if(r != 13) {
+      printf("\nwriting failed, tried 13 bytes, actually wrote %d\n", r);
+      printf("    errno = %d, %s\n", result, strerror(result));
+      exit(1);
+  }
   ext2_close(fe, &result);
   
+  printf("    pass\n");
 //   ext2_print_bg1_bitmap(context);
   
   ext2_umount(context);
