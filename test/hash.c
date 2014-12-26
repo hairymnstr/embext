@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, Nathan Dumont
+ * Copyright (c) 2012-2014, Nathan Dumont
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
@@ -23,7 +23,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  *
- * This file is part of the Gristle FAT16/32 compatible filesystem driver.
+ * This file is part of the Embext EXT2 compatible filesystem driver.
  */
 
 #include <stdio.h>

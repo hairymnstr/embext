@@ -148,6 +148,32 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
   
     printf("    pass\n");
   
+    /* test creating a file */
+    printf("[%4d] %-60s", p++, "create file test");
+    fflush(stdout);
+    
+    fe = ext2_open(context, "/logs/new_test.txt", O_WRONLY | O_CREAT, 0777, &result);
+    if(fe == NULL) {
+        printf("    fail\n");
+        printf("    Open for writing failed, errno=%d (%s)\n", result, strerror(result));
+        exit(-1);
+    }
+    
+    r = ext2_write(fe, "Hello world\n", 12, &result);
+    if(r != 12) {
+        printf("    fail\n");
+        printf("    Writing failed, tried to write 12 bytes, actually wrote %d\n", r);
+        printf("    errno = %d, %s\n", result, strerror(result));
+        exit(-1);
+    }
+    r = ext2_close(fe, &result);
+    if(r) {
+        printf("    fail\n");
+//         printf("    Closing the file failed, errno=%d (%s)\n", result, strerror(result));
+        exit(-1);
+    }
+    printf("    pass\n");
+    
     /* unmount the volume */
     printf("[%4d] %-60s", p++, "unmount volume");
     fflush(stdout);
