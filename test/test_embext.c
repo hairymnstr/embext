@@ -11,7 +11,8 @@
 #include "embext.h"
 
 int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unused__))) {
-    int p = 0, r;
+    int p = 0, r, i;
+    int flen;
     int result;
     char buffer[256];
     struct md_context hash_context;
@@ -91,18 +92,22 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
     
     FILE *fw = fopen("dump.png", "wb");
     if(!(fe = ext2_open(context, "/static/test_image.png", O_RDONLY, 0777, &result))) {
-        printf("    fail [%d] %s\n", result, strerror(result));
+        printf("    fail\n");
+        printf("    Open for reading failed errno=%d (%s)\n", result, strerror(result));
         exit(1);
     }
   
     md5_start(&hash_context);
+    flen = 0;
     while((r = ext2_read(fe, &buffer, sizeof(buffer), &result)) == sizeof(buffer)) {
         fwrite(buffer, 1, r, fw);
         md5_update(&hash_context, (uint8_t *)buffer, r);
+        flen += r;
     }
     if(r > 0) {
         fwrite(buffer, 1, r, fw);
         md5_update(&hash_context, (uint8_t *)buffer, r);
+        flen += r;
     }
     fclose(fw);
     ext2_close(fe, &result);
@@ -121,6 +126,17 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
   
     if(memcmp(hash_context.digest, real_hash, 16)) {
         printf("    fail\n");
+        printf("    Hash comparison failed (read %d bytes),\n", flen);
+        printf("    Expected:   ");
+        for(i=0;i<16;i++) {
+            printf("%02x", (unsigned int)real_hash[i]);
+        }
+        printf("\n");
+        printf("    Calculated: ");
+        for(i=0;i<16;i++) {
+            printf("%02x", (unsigned int)hash_context.digest[i]);
+        }
+        printf("\n");
         exit(1);
     } else {
         printf("    pass\n");
@@ -169,10 +185,18 @@ int main(int argc __attribute__((__unused__)), char *argv[] __attribute__((__unu
     r = ext2_close(fe, &result);
     if(r) {
         printf("    fail\n");
-//         printf("    Closing the file failed, errno=%d (%s)\n", result, strerror(result));
+        printf("    Closing the file failed, errno=%d (%s)\n", result, strerror(result));
         exit(-1);
     }
     printf("    pass\n");
+    
+    fe = ext2_open(context, "/logs/new_test.txt", O_RDONLY, 0777, &result);
+    ext2_fstat(fe, &st, &result);
+    ext2_close(fe, &result);
+    
+    printf("new file inode = %d\n", (int)st.st_ino);
+    printf("new file size = %d\n", (int)st.st_size);
+    ext2_print_inode(fe);
     
     /* unmount the volume */
     printf("[%4d] %-60s", p++, "unmount volume");

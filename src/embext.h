@@ -32,6 +32,9 @@
 
 #define EXT2_ALLOCATED          1
 #define EXT2_DEALLOCATED        0
+
+#define ext2_block_size(x) (1024 << x->superblock.s_log_block_size)
+
 struct superblock {
     uint32_t s_inodes_count;
     uint32_t s_blocks_count;
@@ -126,14 +129,6 @@ struct ext2context {
     uint32_t *superblock_blocks;
 };
 
-struct ext2_dirent {
-    uint32_t inode;
-    uint16_t rec_len;
-    uint8_t name_len;
-    uint8_t file_type;
-    char name;
-};
-
 int ext2_mount(blockno_t part_start, blockno_t volume_size, uint8_t filesystem_hint, struct ext2context **context);
 int ext2_umount(struct ext2context *context);
 
@@ -154,7 +149,7 @@ int ext2_lseek(void *vfe, int ptr, int dir, int *rerrno);
 struct dirent *ext2_readdir(void *vfe, int *rerrno);
 
 #ifdef EMBEXT_DEBUG
-void ext2_print_inode(struct inode *in);
+void ext2_print_inode(void *vfe);
 void ext2_print_bg1_bitmap(struct ext2context *context);
 #endif
 #endif /* ifndef EMBEXT2_H */

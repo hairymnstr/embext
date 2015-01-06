@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #ifdef EMBEXT_DEBUG
 #include <inttypes.h>
 #endif
@@ -41,8 +42,7 @@
 #include "block.h"
 #include "partition.h"
 #include "embext.h"
-
-#define ext2_block_size(x) (1024 << x->superblock.s_log_block_size)
+#include "embext_directory.h"
 
 #define EMBEXT_MAGIC 0xEBEDDED2
 
@@ -50,7 +50,6 @@ struct buffer_object {
     uint8_t buffer[512];
     uint32_t lba_block;
     uint16_t dirty;
-    uint16_t stored;
 };
 
 struct file_ent {
@@ -61,45 +60,30 @@ struct file_ent {
     uint32_t inode_number;
     struct buffer_object buffer;
     struct inode inode;
+    int rerrno;
 };
 
-
-static int ext2_store_buffer(struct file_ent *fe, struct buffer_object *buffer) {
-    if(buffer->stored) {
-        // flushing a modified block back to disk
-        block_write(buffer->lba_block + fe->context->part_start, buffer->buffer);
-        buffer->dirty = 0;
-    } else {
-        // this is a new block so needs to be allocated first
-        printf("Allocat: failed\n");
+static int ext2_store_buffer(struct file_ent *fe) {
+    // flushing a modified block back to disk
+    if(block_write(fe->buffer.lba_block + fe->context->part_start, fe->buffer.buffer)) {
+        fe->rerrno = EIO;
+        return -1;
     }
+    fe->buffer.dirty = 0;
     return 0;
 }
 
-static int ext2_load_buffer(struct file_ent *fe, uint32_t block_number, uint32_t offset, struct buffer_object *buffer) {
-    if(buffer->dirty) {
-        ext2_store_buffer(fe, buffer);
+static int ext2_load_buffer(struct file_ent *fe, uint32_t block_number, uint32_t offset) {
+    if(fe->buffer.dirty) {
+        if(ext2_store_buffer(fe)) {
+            return -1;
+        }
     }
-    buffer->lba_block = block_number * (ext2_block_size(fe->context) / block_get_block_size());
-    buffer->lba_block += (offset / sizeof(buffer->buffer)) * (sizeof(buffer->buffer) / block_get_block_size());
-    block_read(buffer->lba_block + fe->context->part_start, buffer->buffer);
-    // mark this as a valid on-disk buffer that just needs to be flushed not allocated
-    buffer->stored = 1;
+    fe->buffer.lba_block = block_number * (ext2_block_size(fe->context) / block_get_block_size());
+    fe->buffer.lba_block += (offset / sizeof(fe->buffer.buffer)) * (sizeof(fe->buffer.buffer) / block_get_block_size());
+    block_read(fe->buffer.lba_block + fe->context->part_start, fe->buffer.buffer);
     return 0;
-}
-
-static int ext2_new_buffer(struct file_ent *fe, struct buffer_object *buffer) {
-    if(buffer->dirty) {
-        ext2_store_buffer(fe, buffer);
-    }
-    // new parts of files are always zero
-    // don't mark as dirty until some data has actually been written here
-    memset(buffer->buffer, 0, sizeof(buffer->buffer));
-    // mark this buffer as unstored so that a new block will be allocated when store() is called
-    buffer->stored = 0;
-    return 0;
-}
-    
+}    
 
 static int ext2_read_buffer(void *dest, struct buffer_object *buffer, int offset, int count) {
     memcpy(dest, &buffer->buffer[offset % sizeof(buffer->buffer)], count);
@@ -117,9 +101,10 @@ static uint32_t ext2_buffer_space(struct file_ent *fe) {
 }
 
 #ifdef EMBEXT_DEBUG
-void ext2_print_inode(struct inode *in) {
+void ext2_print_inode(void *fe) {
     int i;
-    printf("i_mode = %" PRIu16 "\n", in->i_mode);
+    struct inode *in = &((struct file_ent *)fe)->inode;
+    printf("i_mode = 0%o\n", in->i_mode);
     printf("i_uid = %" PRIu16 "\n", in->i_uid);
     printf("i_size = %" PRIu32 "\n", in->i_size);
     printf("i_atime = %" PRIu32 "\n", in->i_atime);
@@ -211,74 +196,6 @@ void ext2_print_bg1_bitmap(struct ext2context *context) {
           );
 }
 #endif /* ifdef EMBEXT_DEBUG */
-/*
-int ext2_flush(struct file_ent *fe) {
-    if(fe->flags & EXT2_FLAG_DIRTY) {
-        if(fe->sector == 0) {
-            // new file
-            printf("New file, not supported.\r\n");
-        } else {
-            if(block_write(fe->sector, fe->buffer)) {
-                return -1;
-        }
-        fe->flags &= ~EXT2_FLAG_DIRTY;
-        }
-    }
-    return 0;
-}*/
-
-int ext2_flush_inode(struct file_ent *fe) {
-    uint32_t inode_block;
-    uint32_t block_group = (fe->inode_number - 1) / fe->context->superblock.s_inodes_per_group;
-    uint32_t inode_index = (fe->inode_number - 1) % fe->context->superblock.s_inodes_per_group;
-    // now load the block group descriptor for that block group
-    uint32_t bg_block;
-    struct block_group_descriptor *block_table;
-
-    if(fe->flags & EXT2_FLAG_FS_DIRTY) {
-        // block group descriptor table always starts immediately after the superblock
-        // it may be more than one block long but is always contiguous
-        bg_block = fe->context->superblock_block + 1;
-        bg_block += (block_group * sizeof(struct block_group_descriptor)) / ext2_block_size(fe->context);
-        
-        ext2_load_buffer(fe, bg_block, 
-                         (block_group * sizeof(struct block_group_descriptor)) % ext2_block_size(fe->context),
-                         &fe->buffer);
-    
-        block_table = (struct block_group_descriptor *)&fe->buffer.buffer[(block_group * sizeof(struct block_group_descriptor)) % sizeof(fe->buffer.buffer)];
-    
-        // the inode table may again be more than one block but it is contiguous within each
-        // block group.  Since we're already looking at the right block group we can now treat it
-        // as contiguous.
-        inode_block = block_table->bg_inode_table;
-        inode_block += inode_index / (ext2_block_size(fe->context) / fe->context->superblock.s_inode_size);
-    
-        // load the sector
-        ext2_load_buffer(fe, inode_block,
-                         (inode_index * fe->context->superblock.s_inode_size) % ext2_block_size(fe->context),
-                         &fe->buffer);
-
-        ext2_write_buffer(&fe->buffer, &fe->inode, inode_index * fe->context->superblock.s_inode_size, sizeof(struct inode));
-
-        ext2_store_buffer(fe, &fe->buffer);
-    
-        fe->flags &= ~EXT2_FLAG_FS_DIRTY;
-    }
-  
-    return 0;
-}
-
-int ext2_flush_superblock(struct ext2context *context) {
-    uint32_t i;
-    
-    memset(context->sysbuf, 0, block_get_block_size());
-    for(i=0;i<context->num_superblocks;i++) {
-        context->superblock.s_block_group_nr = context->superblock_blocks[i];
-        memcpy(context->sysbuf, &context->superblock, sizeof(struct superblock));
-        block_write((context->superblock_blocks[i] << (context->superblock.s_log_block_size + 1)) + context->part_start, context->sysbuf);
-    }
-    return 0;
-}
 
 /**
  * \brief fetches a block group descriptor from disk.
@@ -362,6 +279,48 @@ int ext2_write_bg_descriptor(struct ext2context *context,
     return 0;
 }
 
+int ext2_flush_inode(struct file_ent *fe) {
+    uint32_t inode_block;
+    uint32_t block_group = (fe->inode_number - 1) / fe->context->superblock.s_inodes_per_group;
+    uint32_t inode_index = (fe->inode_number - 1) % fe->context->superblock.s_inodes_per_group;
+    // now load the block group descriptor for that block group
+    struct block_group_descriptor bg;
+
+    if(fe->flags & EXT2_FLAG_FS_DIRTY) {
+        ext2_get_bg_descriptor(fe->context, &bg, block_group);
+        
+        // the inode table may again be more than one block but it is contiguous within each
+        // block group.  Since we're already looking at the right block group we can now treat it
+        // as contiguous.
+        inode_block = bg.bg_inode_table;
+        inode_block += inode_index / (ext2_block_size(fe->context) / fe->context->superblock.s_inode_size);
+    
+        // load the sector
+        ext2_load_buffer(fe, inode_block,
+                         (inode_index * fe->context->superblock.s_inode_size) % ext2_block_size(fe->context));
+
+        ext2_write_buffer(&fe->buffer, &fe->inode, inode_index * fe->context->superblock.s_inode_size, sizeof(struct inode));
+
+        ext2_store_buffer(fe);
+    
+        fe->flags &= ~EXT2_FLAG_FS_DIRTY;
+    }
+  
+    return 0;
+}
+
+int ext2_flush_superblock(struct ext2context *context) {
+    uint32_t i;
+    
+    memset(context->sysbuf, 0, block_get_block_size());
+    for(i=0;i<context->num_superblocks;i++) {
+        context->superblock.s_block_group_nr = context->superblock_blocks[i];
+        memcpy(context->sysbuf, &context->superblock, sizeof(struct superblock));
+        block_write((context->superblock_blocks[i] << (context->superblock.s_log_block_size + 1)) + context->part_start, context->sysbuf);
+    }
+    return 0;
+}
+
 /**
  * \brief Carries out an allocation/deallocation of a block.
  * 
@@ -436,43 +395,140 @@ int ext2_change_allocated(struct ext2context *context,
     return 0;
 }
 
-uint32_t ext2_allocate_block(struct ext2context *context, uint32_t previous_block, int for_directory) {
-    uint32_t lba_block;
-    uint32_t bitmap_offset;
+static int ext2_allocate_inode(struct file_ent *fe) {
+    uint32_t i, j;
+    struct block_group_descriptor bg;
+    int most_free_inodes = 0;
+    int most_free_inodes_group = 0;
+    uint8_t bitmap_byte;
+    
+    for(i=0;i<fe->context->num_blockgroups;i++) {
+        ext2_get_bg_descriptor(fe->context, &bg, i);
+        if(most_free_inodes < bg.bg_free_inodes_count) {
+            most_free_inodes = bg.bg_free_inodes_count;
+            most_free_inodes_group = i;
+        }
+        printf("%d free inodes in group %d\n", bg.bg_free_inodes_count, i);
+    }
+    if(most_free_inodes == 0) {
+        printf("No free inodes\n");
+        fe->rerrno = ENOSPC;
+        return -1;
+    }
+    printf("Allocating new inode in group %d\n", most_free_inodes_group);
+    ext2_get_bg_descriptor(fe->context, &bg, most_free_inodes_group);
+    
+    for(i=0;i<fe->context->superblock.s_inodes_per_group/8;i++) {
+        ext2_load_buffer(fe, bg.bg_inode_bitmap, i);
+        ext2_read_buffer(&bitmap_byte, &fe->buffer, i, 1);
+        for(j=0;j<8;j++) {
+            if(!(bitmap_byte & (1 << j))) {
+                break;
+            }
+        }
+        if(j < 8) {
+            break;
+        }
+    }
+    if((i < fe->context->superblock.s_inodes_per_group) && (j < 8)) {
+        fe->inode_number = (fe->context->superblock.s_inodes_per_group * most_free_inodes_group +
+                            i * 8 + j + 1);
+        bitmap_byte |= (1 << j);        // allocate this inode in the bitmap
+        ext2_write_buffer(&fe->buffer, &bitmap_byte, i, 1);
+        ext2_store_buffer(fe);
+        bg.bg_free_inodes_count -= 1;   // decrement the inode count
+        ext2_write_bg_descriptor(fe->context, &bg, most_free_inodes_group);
+        fe->context->superblock.s_free_inodes_count -= 1;
+        ext2_flush_superblock(fe->context);
+        printf("Allocating new inode %d\n", fe->inode_number);
+    } else {
+        // this should never happen because we've already determined that there are free
+        // inodes in this block group.  So this must be an error in the filesystem or the
+        // driver.
+        fe->rerrno = EIO;
+        return -1;
+    }
+    
+    return 0;
+}
+
+uint32_t ext2_allocate_block(struct file_ent *fe, uint32_t previous_block) {
+//     uint32_t block_group = (fe->inode_number - 1) / fe->context->superblock.s_inodes_per_group;
+//     uint32_t block_index = (fe->inode_number - 1) % fe->context->superblock.s_inodes_per_group;
+//     uint32_t lba_block;
+//     uint32_t bitmap_offset;
+    uint8_t bitmap_byte;
+    uint32_t i, j;
+    uint32_t block_no;
+    int most_free_blocks = 0, most_free_blocks_group = 0;
     struct block_group_descriptor bg;
     
     // if there is a previous block specified and it wasn't the last block in its group
-    if(previous_block && ((previous_block + 1) % context->superblock.s_blocks_per_group)) {
-        ext2_get_bg_descriptor(context, &bg, previous_block / context->superblock.s_blocks_per_group);
-        
-        // don't bother reading the bitmap if the group is full
-        if(bg.bg_free_blocks_count > 0) {
-            // find the block number that stores the allocation bitmap
-            lba_block = bg.bg_block_bitmap;
-            
-            // convert the start of block to a disk location
-            lba_block <<= (context->superblock.s_log_block_size + 1);
-            
-            bitmap_offset = (previous_block + 1);
-            
-            // limit it to blocks within the current group
-            bitmap_offset %= context->superblock.s_blocks_per_group;
-            
-            lba_block += (bitmap_offset / 8) / block_get_block_size();
-            
-            block_read(lba_block + context->part_start, context->sysbuf);
-            
-            if(!(context->sysbuf[(bitmap_offset / 8) % block_get_block_size()] & (1 << (bitmap_offset % 8)))) {
-                // next block is free, allocate it
-                if(ext2_change_allocated(context, previous_block + 1, EXT2_ALLOCATED, for_directory)) {
-                    return 0;
-                } else {
-                    return previous_block + 1;
-                }
+//     if(previous_block && ((previous_block + 1) % context->superblock.s_blocks_per_group)) {
+//         ext2_get_bg_descriptor(context, &bg, previous_block / context->superblock.s_blocks_per_group);
+//         
+//         // don't bother reading the bitmap if the group is full
+//         if(bg.bg_free_blocks_count > 0) {
+//             // find the block number that stores the allocation bitmap
+//             lba_block = bg.bg_block_bitmap;
+//             
+//             // convert the start of block to a disk location
+//             lba_block <<= (context->superblock.s_log_block_size + 1);
+//             
+//             bitmap_offset = (previous_block + 1);
+//             
+//             // limit it to blocks within the current group
+//             bitmap_offset %= context->superblock.s_blocks_per_group;
+//             
+//             lba_block += (bitmap_offset / 8) / block_get_block_size();
+//             
+//             block_read(lba_block + context->part_start, context->sysbuf);
+//             
+//             if(!(context->sysbuf[(bitmap_offset / 8) % block_get_block_size()] & (1 << (bitmap_offset % 8)))) {
+//                 // next block is free, allocate it
+//                 if(ext2_change_allocated(context, previous_block + 1, EXT2_ALLOCATED, for_directory)) {
+//                     return 0;
+//                 } else {
+//                     return previous_block + 1;
+//                 }
+//             }
+//         }
+//     } else {
+        // no previous block, or next block was already allocated start somewhere new
+        for(i=0;i<fe->context->num_blockgroups;i++) {
+            ext2_get_bg_descriptor(fe->context, &bg, i);
+            if(most_free_blocks < bg.bg_free_blocks_count) {
+                most_free_blocks = bg.bg_free_blocks_count;
+                most_free_blocks_group = i;
             }
         }
-    }
-    // no previous block, or next block was already allocated start somewhere new
+        if(most_free_blocks == 0) {
+            fe->rerrno = ENOSPC;
+            return 0;
+        }
+        ext2_get_bg_descriptor(fe->context, &bg, most_free_blocks_group);
+        
+        for(i=0;i<fe->context->superblock.s_blocks_per_group/8;i++) {
+            ext2_load_buffer(fe, bg.bg_block_bitmap, i);
+            ext2_read_buffer(&bitmap_byte, &fe->buffer, i, 1);
+            for(j=0;j<8;j++) {
+                if(!(bitmap_byte & (1 << j))) {
+                    break;
+                }
+            }
+            if(j < 8) {
+                break;
+            }
+        }
+        if((i < fe->context->superblock.s_blocks_per_group/8) && (j < 8)) {
+            block_no = (fe->context->superblock.s_blocks_per_group * most_free_blocks_group + 
+                        i * 8 + j + 1);
+            if(ext2_change_allocated(fe->context, block_no, EXT2_ALLOCATED, fe->inode.i_mode & S_IFDIR ? 1 : 0)) {
+                return 0;
+            }
+            return block_no;
+        }
+//     }
     
     return 0;
 }
@@ -491,7 +547,7 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[12]) {
         // indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe, fe->inode.i_block[12], i * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[12], i * 4);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 ext2_change_allocated(fe->context, block, EXT2_DEALLOCATED, isdir);
@@ -506,11 +562,11 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[13]) {
         // double indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe, fe->inode.i_block[13], i *4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[13], i *4);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 for(j=0;j<indirect_entries;j++) {
-                    ext2_load_buffer(fe, block, j * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, j * 4);
                     ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
                     if(block2) {
                         ext2_change_allocated(fe->context, block2, EXT2_DEALLOCATED, isdir);
@@ -529,15 +585,15 @@ int ext2_truncate_file(struct file_ent *fe) {
     if(fe->inode.i_block[14]) {
         // triply indirect blocks
         for(i=0;i<indirect_entries;i++) {
-            ext2_load_buffer(fe, fe->inode.i_block[13], i * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[13], i * 4);
             ext2_read_buffer(&block, &fe->buffer, i * 4, 4);
             if(block) {
                 for(j=0;j<indirect_entries;j++) {
-                    ext2_load_buffer(fe, block, j * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, j * 4);
                     ext2_read_buffer(&block2, &fe->buffer, j * 4, 4);
                     if(block2) {
                         for(k=0;k<indirect_entries;k++) {
-                            ext2_load_buffer(fe, block, k * 4, &fe->buffer);
+                            ext2_load_buffer(fe, block, k * 4);
                             ext2_read_buffer(&block3, &fe->buffer, k * 4, 4);
                             if(block3) {
                                 ext2_change_allocated(fe->context, block3, EXT2_DEALLOCATED, isdir);
@@ -575,7 +631,7 @@ int ext2_update_mtime(struct file_ent *fe) {
     return 0;
 }
 
-int ext2_open_inode(struct file_ent *fe, int inode) {
+int ext2_open_inode(struct file_ent *fe, uint32_t inode) {
     struct block_group_descriptor *block_table;
     uint32_t inode_block;
     uint32_t block_group = (inode - 1) / fe->context->superblock.s_inodes_per_group;
@@ -583,6 +639,11 @@ int ext2_open_inode(struct file_ent *fe, int inode) {
     // now load the block group descriptor for that block group
     uint32_t bg_block = fe->context->superblock_block + 1;
   
+    /* check for a bad inode number */
+    if((inode > fe->context->superblock.s_inodes_count) || (inode == 0)) {
+        return -1;
+    }
+        
     bg_block <<= (fe->context->superblock.s_log_block_size + 1);
   
     bg_block += ((block_group * 32) / block_get_block_size());
@@ -628,7 +689,10 @@ int ext2_lookup_path(struct file_ent *fe, const char *path, int *rerrno) {
     }
   
     for(i=0;i<levels;i++) {
-        ext2_open_inode(fe, ino);
+        if(ext2_open_inode(fe, ino)) {
+            *rerrno = ENOENT;
+            return -1;
+        }
         de = ext2_readdir(fe, rerrno);
         while(de != NULL) {
             if(strcmp(de->d_name, elements[i]) == 0) {
@@ -644,11 +708,11 @@ int ext2_lookup_path(struct file_ent *fe, const char *path, int *rerrno) {
     }
 
     // right, ino is now the inode of the target file/directory
-    return ext2_open_inode(fe, ino);
+    return ino;//ext2_open_inode(fe, ino);
 }
 
-int ext2_select_buffer(struct file_ent *fe) {
-    uint32_t block_index = fe->cursor / ext2_block_size(fe->context);
+static uint32_t ext2_block_from_offset(struct file_ent *fe, uint64_t offset) {
+    uint32_t block_index = offset / ext2_block_size(fe->context);
     uint32_t block;
     uint32_t indirect_entries = (ext2_block_size(fe->context) / 4);
     
@@ -657,23 +721,23 @@ int ext2_select_buffer(struct file_ent *fe) {
     } else {
         block_index -= 12;
         if(block_index < indirect_entries) {
-            ext2_load_buffer(fe, fe->inode.i_block[12], block_index * 4, &fe->buffer);
+            ext2_load_buffer(fe, fe->inode.i_block[12], block_index * 4);
             ext2_read_buffer(&block, &fe->buffer, block_index * 4, 4);
         } else {
             block_index -= indirect_entries;
             if(block_index < indirect_entries * indirect_entries) {
-                ext2_load_buffer(fe, fe->inode.i_block[13], (block_index / indirect_entries) * 4, &fe->buffer);
+                ext2_load_buffer(fe, fe->inode.i_block[13], (block_index / indirect_entries) * 4);
                 ext2_read_buffer(&block, &fe->buffer, (block_index / indirect_entries) * 4, 4);
-                ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4);
                 ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
             } else {
                 block_index -= indirect_entries * indirect_entries;
                 if(block_index < indirect_entries * indirect_entries * indirect_entries) {
-                    ext2_load_buffer(fe, fe->inode.i_block[14], (block_index / (indirect_entries * indirect_entries)) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, fe->inode.i_block[14], (block_index / (indirect_entries * indirect_entries)) * 4);
                     ext2_read_buffer(&block, &fe->buffer, (block_index / (indirect_entries * indirect_entries)) * 4, 4);
-                    ext2_load_buffer(fe, block, ((block_index / indirect_entries) % indirect_entries) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, ((block_index / indirect_entries) % indirect_entries) * 4);
                     ext2_read_buffer(&block, &fe->buffer, ((block_index / indirect_entries) % indirect_entries) * 4, 4);
-                    ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4, &fe->buffer);
+                    ext2_load_buffer(fe, block, (block_index % indirect_entries) * 4);
                     ext2_read_buffer(&block, &fe->buffer, (block_index % indirect_entries) * 4, 4);
                 } else {
                     /* cursor past largest file size possible */
@@ -682,48 +746,32 @@ int ext2_select_buffer(struct file_ent *fe) {
             }
         }
     }
+    
+    return block;
+}
+
+int ext2_select_buffer(struct file_ent *fe) {
+    uint32_t block = ext2_block_from_offset(fe, fe->cursor);
+    uint32_t new_block;
+    uint32_t previous_block = ext2_block_from_offset(fe, ((fe->cursor / ext2_block_size(fe->context)) - 1) * ext2_block_size(fe->context));
+    
     if(block) {
-        ext2_load_buffer(fe, block, fe->cursor % ext2_block_size(fe->context), &fe->buffer);
+        ext2_load_buffer(fe, block, fe->cursor % ext2_block_size(fe->context));
     } else {
         if(fe->flags & EXT2_FLAG_WRITE) {
-            ext2_new_buffer(fe, &fe->buffer);
+            new_block = ext2_allocate_block(fe, previous_block);
+            if(new_block) {
+                fe->inode.i_block[0] = new_block;
+                ext2_load_buffer(fe, block, fe->cursor % ext2_block_size(fe->context));
+            } else {
+                return -1;
+            }
         } else {
             return -1;
         }
     }
     return 0;
 }
-/*
-int ext2_next_block(struct file_ent *fe) {
-  
-    if(fe->block_index[0] < 11) {
-        fe->block_index[0]++;
-        if(fe->inode.i_block[fe->block_index[0]] > 0) {
-            fe->sectors_left = ((1 << (10 + fe->context->superblock.s_log_block_size)) / block_get_block_size()) - 1;
-            fe->sector = (fe->inode.i_block[fe->block_index[0]] << (fe->context->superblock.s_log_block_size + 1)) + fe->context->part_start;
-            fe->cursor = 0;
-            fe->file_sector++;
-            return block_read(fe->sector, fe->buffer);
-        } else {
-            return 1;
-        }
-    } else {
-        printf("Oh dear, indirect block :(\n");
-        return 1;
-    }
-    return 0;
-}
-
-int ext2_next_sector(struct file_ent *fe) {
-    if(fe->sectors_left > 0) {
-        block_read(++fe->sector, fe->buffer);
-        fe->sectors_left--;
-        fe->cursor = 0;
-        fe->file_sector++;
-        return 0;
-    }
-    return ext2_next_block(fe);
-}*/
 
 int is_power(int x, int ofy) {
     while((x % ofy ) == 0) {
@@ -832,7 +880,9 @@ int ext2_umount(struct ext2context *context) {
 
 void *ext2_open(struct ext2context *context, const char *name, int flags, int mode, 
                            int *rerrno) {
-    int i;
+    int i, ino, internal_call = mode & 01000;
+    mode = mode & 0777;
+    char *local_path = NULL, *local_name = NULL;
     struct file_ent *fe = (struct file_ent *)malloc(sizeof(struct file_ent));
     if(fe == NULL) {
         (*rerrno) = ENOMEM;
@@ -841,7 +891,8 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
     memset(fe, 0, sizeof(struct file_ent));
     fe->magic = EMBEXT_MAGIC;
     fe->context = context;
-    i = ext2_lookup_path(fe, name, rerrno);
+    ino = ext2_lookup_path(fe, name, rerrno);
+    i = ext2_open_inode(fe, ino);
     if((flags & O_RDWR)) {
         fe->flags |= (EXT2_FLAG_READ | EXT2_FLAG_WRITE);
     } else {
@@ -872,12 +923,72 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
                 (*rerrno) = EROFS;
                 return NULL;
             }
-            /* all fields are zero, including inode number so a file will be created upon write */
+            if(ext2_allocate_inode(fe)) {
+                fe->magic = 0;
+                *rerrno = fe->rerrno;
+                free(fe);
+                return NULL;
+            }
+            for(i=strlen(name)-1;i>-1;i--) {
+                if(name[i] == '/') {
+                    printf("Found last separator in\n%s\nat %d\n", name, i);
+                    local_path = (char *)malloc(i+1);
+                    local_name = (char *)malloc(strlen(name) - i);
+                    strncpy(local_path, name, i);
+                    local_path[i] = 0;
+                    strncpy(local_name, &name[i+1], strlen(name) - i);
+                    break;
+                }
+            }
+            if(local_path == NULL) {
+                *rerrno = ENOENT;
+                fe->magic = 0;
+                free(fe);
+                return NULL;
+            }
+            if(ext2_append_to_directory(fe->context, local_path, fe->inode_number,
+                                        local_name, rerrno)) {
+                free(local_path);
+                free(local_name);
+                fe->magic = 0;
+                free(fe);
+                return NULL;
+            }
+            /* finished with these so free before they get forgotten */
+            free(local_path);
+            free(local_name);
+            /* allocated an inode in the bitmap and group/superblock counts */
+            /* now need to write the fields in the new inode */
+            fe->inode.i_mode = mode;
+            fe->inode.i_uid = getuid();
+            fe->inode.i_gid = getgid();
+            fe->inode.i_size = 0;
+            fe->inode.i_atime = time(NULL);
+            fe->inode.i_ctime = time(NULL);
+            fe->inode.i_mtime = time(NULL);
+            fe->inode.i_dtime = 0;
+            fe->inode.i_links_count = 1;
+            fe->inode.i_blocks = 0;
+            fe->inode.i_flags = 0;
+            fe->inode.i_osd1 = 0;
+            memset(fe->inode.i_block, 0, sizeof(fe->inode.i_block));
+            fe->inode.i_generation = 0;
+            fe->inode.i_file_acl = 0;
+            fe->inode.i_dir_acl = 0;
+            fe->inode.i_faddr = 0;
+            memset(fe->inode.i_osd2, 0, sizeof(fe->inode.i_osd2));
+            
+            ext2_print_inode(fe);
+            
+            fe->cursor = 0;
+            
+            fe->flags |= EXT2_FLAG_FS_DIRTY;
+            ext2_flush_inode(fe);
             return fe;
         }
     } else if(i == 0) {
         /* file does exist */
-        if(flags & (O_CREAT | O_EXCL)) {
+        if((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
             /* tried to force creation of an existing file */
             free(fe);
             (*rerrno) = EEXIST;
@@ -901,7 +1012,7 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
 //           (*rerrno) = EACCES;
 //           return NULL;
 //         }
-                if(fe->inode.i_mode & EXT2_S_IFDIR) {
+                if((fe->inode.i_mode & EXT2_S_IFDIR) && (!internal_call)) {
                     /* Tried to open a directory for writing */
                     free(fe);
                     (*rerrno) = EISDIR;
@@ -932,17 +1043,18 @@ int ext2_close(void *vfe, int *rerrno) {
         return -1;
     }
     if(fe->buffer.dirty) {
-        if(ext2_store_buffer(fe, &fe->buffer)) {
-            *rerrno = EIO;
+        if(ext2_store_buffer(fe)) {
+            *rerrno = fe->rerrno;
             return -1;
         }
     }
     if(fe->flags & EXT2_FLAG_FS_DIRTY) {
         if(ext2_flush_inode(fe)) {
-            *rerrno = EIO;
+            *rerrno = fe->rerrno;
             return -1;
         }
     }
+    ext2_print_inode(fe);
     fe->magic = 0;
     free(fe);
     return 0;
