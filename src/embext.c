@@ -762,7 +762,7 @@ int ext2_select_buffer(struct file_ent *fe) {
             new_block = ext2_allocate_block(fe, previous_block);
             if(new_block) {
                 fe->inode.i_block[0] = new_block;
-                ext2_load_buffer(fe, block, fe->cursor % ext2_block_size(fe->context));
+                ext2_load_buffer(fe, new_block, fe->cursor % ext2_block_size(fe->context));
             } else {
                 return -1;
             }
@@ -959,7 +959,7 @@ void *ext2_open(struct ext2context *context, const char *name, int flags, int mo
             free(local_name);
             /* allocated an inode in the bitmap and group/superblock counts */
             /* now need to write the fields in the new inode */
-            fe->inode.i_mode = mode;
+            fe->inode.i_mode = mode | EXT2_S_IFREG;
             fe->inode.i_uid = getuid();
             fe->inode.i_gid = getgid();
             fe->inode.i_size = 0;
