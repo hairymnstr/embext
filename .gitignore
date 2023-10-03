@@ -3,4 +3,5 @@ test/test_gristle
 test/test_embext
 test/show_info
 docs/
-
+test/dump.png
+test/test_image.md5
